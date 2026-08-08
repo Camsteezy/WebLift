@@ -1,6 +1,6 @@
 "use server"
 
-import { and, count, desc, eq, gte, isNotNull, sql } from "drizzle-orm"
+import { and, count, desc, eq, gte, isNotNull, lte, sql } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
 import { db } from "@/lib/db"
 import { crawlSites } from "@/lib/db/schema"
@@ -9,6 +9,32 @@ import { isAllowed } from "@/lib/crawler/robots"
 
 const MAX_LINKS_PER_PAGE = 25
 const MAX_BATCH = 20
+// Ceilings for a single "Run batch" click. The run walks the queue until the
+// depth budget is exhausted, so it needs its own stopping conditions.
+const MAX_PAGES_PER_RUN = 150
+// Keep a run comfortably inside a serverless function timeout. Raise the
+// route's maxDuration alongside this if you raise it.
+const RUN_TIME_BUDGET_MS = 15_000
+// How many pages (and robots lookups) to have in flight at once.
+const CONCURRENCY = 5
+
+/** Runs `fn` over `items` with at most `limit` in flight, preserving order. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      results[index] = await fn(items[index])
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
 
 function domainOf(url: string): string | null {
   try {
@@ -54,16 +80,19 @@ export async function seedCrawl(formData: FormData) {
   return { ok: true, message: `Queued ${rows.length} seed URL(s).` }
 }
 
+/** Returns how many rows were actually inserted. */
 async function enqueueLinks(
   links: string[],
   sourceUrl: string,
   nextDepth: number,
   followExternal: boolean,
   sourceDomain: string,
-) {
+): Promise<number> {
   const candidates: { url: string; domain: string; sourceUrl: string; depth: number }[] = []
   const seen = new Set<string>()
 
+  // Apply the cheap filters first, so the expensive robots lookups below only
+  // run for links we would actually keep.
   for (const link of links) {
     if (candidates.length >= MAX_LINKS_PER_PAGE) break
     const domain = domainOf(link)
@@ -74,11 +103,21 @@ async function enqueueLinks(
     candidates.push({ url: link, domain, sourceUrl, depth: nextDepth })
   }
 
-  if (candidates.length === 0) return
-  await db
+  if (candidates.length === 0) return 0
+
+  const checked = await mapLimit(candidates, CONCURRENCY, async (candidate) =>
+    (await isAllowed(candidate.url)) ? candidate : null,
+  )
+  const allowed = checked.filter((c) => c !== null)
+  if (allowed.length === 0) return 0
+
+  const inserted = await db
     .insert(crawlSites)
-    .values(candidates.map((c) => ({ ...c, status: "pending" as const })))
+    .values(allowed.map((c) => ({ ...c, status: "pending" as const })))
     .onConflictDoNothing()
+    .returning({ id: crawlSites.id })
+
+  return inserted.length
 }
 
 export async function processQueue(opts: {
@@ -89,72 +128,96 @@ export async function processQueue(opts: {
   const batchSize = Math.min(Math.max(opts.batchSize ?? 5, 1), MAX_BATCH)
   const maxDepth = Math.min(Math.max(opts.maxDepth ?? 1, 0), 4)
   const followExternal = opts.followExternal ?? true
-
-  // Atomically claim a batch of pending rows.
-  const claimed = await db
-    .update(crawlSites)
-    .set({ status: "crawling" })
-    .where(
-      sql`${crawlSites.id} IN (
-        SELECT id FROM ${crawlSites}
-        WHERE status = 'pending'
-        ORDER BY depth ASC, created_at ASC
-        LIMIT ${batchSize}
-      )`,
-    )
-    .returning()
+  const deadline = Date.now() + RUN_TIME_BUDGET_MS
 
   let processed = 0
   let discovered = 0
+  let stoppedEarly = false
 
-  for (const site of claimed) {
-    const analysis = await analyzePage(site.url)
-    processed++
+  // Keep draining the queue until the depth budget is exhausted. The claim is
+  // ordered by depth, so this walks the queue breadth-first: one click crawls
+  // to `maxDepth` rather than advancing a single level.
+  while (true) {
+    if (processed >= MAX_PAGES_PER_RUN || Date.now() >= deadline) {
+      stoppedEarly = true
+      break
+    }
 
-    if (analysis.error && analysis.httpStatus === null) {
+    const limit = Math.min(batchSize, MAX_PAGES_PER_RUN - processed)
+
+    // Atomically claim a batch of pending rows within the depth budget.
+    // SKIP LOCKED keeps two concurrent runs from claiming the same rows.
+    const claimed = await db
+      .update(crawlSites)
+      .set({ status: "crawling" })
+      .where(
+        sql`${crawlSites.id} IN (
+          SELECT id FROM ${crawlSites}
+          WHERE status = 'pending' AND depth <= ${maxDepth}
+          ORDER BY depth ASC, created_at ASC
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
+        )`,
+      )
+      .returning()
+
+    if (claimed.length === 0) break
+
+    // Always finish a claimed batch, so nothing is left stranded in 'crawling'.
+    await mapLimit(claimed, CONCURRENCY, async (site) => {
+      const analysis = await analyzePage(site.url)
+
+      if (analysis.error && analysis.httpStatus === null) {
+        await db
+          .update(crawlSites)
+          .set({ status: "error", error: analysis.error, analyzedAt: new Date() })
+          .where(eq(crawlSites.id, site.id))
+        return
+      }
+
       await db
         .update(crawlSites)
-        .set({ status: "error", error: analysis.error, analyzedAt: new Date() })
+        .set({
+          status: analysis.error ? "error" : "crawled",
+          httpStatus: analysis.httpStatus,
+          title: analysis.title,
+          overallScore: analysis.overallScore,
+          seoScore: analysis.seoScore,
+          designScore: analysis.designScore,
+          issues: analysis.issues,
+          error: analysis.error ?? null,
+          analyzedAt: new Date(),
+        })
         .where(eq(crawlSites.id, site.id))
-      continue
-    }
 
-    await db
-      .update(crawlSites)
-      .set({
-        status: analysis.error ? "error" : "crawled",
-        httpStatus: analysis.httpStatus,
-        title: analysis.title,
-        overallScore: analysis.overallScore,
-        seoScore: analysis.seoScore,
-        designScore: analysis.designScore,
-        issues: analysis.issues,
-        error: analysis.error ?? null,
-        analyzedAt: new Date(),
-      })
-      .where(eq(crawlSites.id, site.id))
-
-    // Follow links if we have depth budget left and robots allows.
-    const nextDepth = site.depth + 1
-    if (nextDepth <= maxDepth && analysis.links.length > 0) {
-      const allowedLinks: string[] = []
-      for (const link of analysis.links.slice(0, MAX_LINKS_PER_PAGE * 2)) {
-        if (await isAllowed(link)) allowedLinks.push(link)
+      // Follow links if we have depth budget left and robots allows.
+      const nextDepth = site.depth + 1
+      if (nextDepth <= maxDepth && analysis.links.length > 0) {
+        discovered += await enqueueLinks(
+          analysis.links,
+          site.url,
+          nextDepth,
+          followExternal,
+          site.domain,
+        )
       }
-      const before = allowedLinks.length
-      await enqueueLinks(
-        allowedLinks,
-        site.url,
-        nextDepth,
-        followExternal,
-        site.domain,
-      )
-      discovered += before
-    }
+    })
+
+    processed += claimed.length
   }
 
+  const [remainingRow] = await db
+    .select({ n: count() })
+    .from(crawlSites)
+    .where(and(eq(crawlSites.status, "pending"), lte(crawlSites.depth, maxDepth)))
+
   revalidatePath("/")
-  return { processed, discovered }
+  return {
+    processed,
+    discovered,
+    remaining: Number(remainingRow?.n ?? 0),
+    stoppedEarly,
+  }
 }
 
 export async function getStats() {

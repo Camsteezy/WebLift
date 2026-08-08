@@ -43,9 +43,15 @@ export function CrawlConsole({ pending }: { pending: number }) {
       const res = await processQueue({ batchSize, maxDepth, followExternal })
       if (res.processed === 0) {
         toast.info("Queue is empty — add some seed URLs to crawl.")
+      } else if (res.stoppedEarly) {
+        toast.success(
+          `Analyzed ${res.processed} page(s), discovered ${res.discovered} new link(s). ` +
+            `Stopped at this run's limit — ${res.remaining} still queued, run again to continue.`,
+        )
       } else {
         toast.success(
-          `Analyzed ${res.processed} page(s), discovered ${res.discovered} new link(s).`,
+          `Analyzed ${res.processed} page(s) to depth ${maxDepth}, ` +
+            `discovered ${res.discovered} new link(s).`,
         )
       }
       router.refresh()
