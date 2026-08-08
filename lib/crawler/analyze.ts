@@ -1,6 +1,8 @@
 import * as cheerio from "cheerio"
 import type { Issue } from "@/lib/db/schema"
-import { stalenessIssues } from "./staleness"
+// Explicit extension so this module is also loadable by bare Node
+// (scripts/scan.ts), not just the bundler.
+import { stalenessIssues } from "./staleness.ts"
 
 export const USER_AGENT =
   "ModernizeBot/1.0 (+https://example.com/bot; website modernization scanner)"
