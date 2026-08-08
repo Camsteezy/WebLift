@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "db:setup": "node --env-file-if-exists=.env.local scripts/db-setup.ts",
+    "scan": "node scripts/scan.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
