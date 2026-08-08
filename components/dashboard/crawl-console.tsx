@@ -114,7 +114,7 @@ export function CrawlConsole({ pending }: { pending: number }) {
               min={0}
               max={4}
               step={1}
-              onValueChange={([v]) => setMaxDepth(v)}
+              onValueChange={(v) => setMaxDepth(Array.isArray(v) ? v[0] : v)}
             />
           </div>
           <div className="flex flex-col gap-2">
@@ -127,7 +127,7 @@ export function CrawlConsole({ pending }: { pending: number }) {
               min={1}
               max={20}
               step={1}
-              onValueChange={([v]) => setBatchSize(v)}
+              onValueChange={(v) => setBatchSize(Array.isArray(v) ? v[0] : v)}
             />
           </div>
         </div>
