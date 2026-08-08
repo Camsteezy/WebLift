@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio"
 import type { Issue } from "@/lib/db/schema"
+import { stalenessIssues } from "./staleness"
 
 export const USER_AGENT =
   "ModernizeBot/1.0 (+https://example.com/bot; website modernization scanner)"
@@ -37,9 +38,12 @@ function normalizeUrl(raw: string, base: string): string | null {
   }
 }
 
-async function fetchHtml(
-  url: string,
-): Promise<{ status: number; html: string; finalUrl: string }> {
+async function fetchHtml(url: string): Promise<{
+  status: number
+  html: string
+  finalUrl: string
+  lastModified: string | null
+}> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
   try {
@@ -51,15 +55,21 @@ async function fetchHtml(
         Accept: "text/html,application/xhtml+xml",
       },
     })
+    const lastModified = res.headers.get("last-modified")
     const contentType = res.headers.get("content-type") ?? ""
     if (!contentType.includes("html")) {
-      return { status: res.status, html: "", finalUrl: res.url || url }
+      return { status: res.status, html: "", finalUrl: res.url || url, lastModified }
     }
     // Read with a byte cap
     const reader = res.body?.getReader()
     if (!reader) {
       const text = await res.text()
-      return { status: res.status, html: text.slice(0, MAX_BYTES), finalUrl: res.url || url }
+      return {
+        status: res.status,
+        html: text.slice(0, MAX_BYTES),
+        finalUrl: res.url || url,
+        lastModified,
+      }
     }
     const decoder = new TextDecoder()
     let html = ""
@@ -71,7 +81,7 @@ async function fetchHtml(
       html += decoder.decode(value, { stream: true })
     }
     reader.cancel().catch(() => {})
-    return { status: res.status, html, finalUrl: res.url || url }
+    return { status: res.status, html, finalUrl: res.url || url, lastModified }
   } finally {
     clearTimeout(timeout)
   }
@@ -87,7 +97,7 @@ function scoreCategory(issues: Issue[], category: Issue["category"]): number {
 export async function analyzePage(url: string): Promise<PageAnalysis> {
   let status: number | null = null
   try {
-    const { status: httpStatus, html, finalUrl } = await fetchHtml(url)
+    const { status: httpStatus, html, finalUrl, lastModified } = await fetchHtml(url)
     status = httpStatus
 
     const isHttps = new URL(finalUrl).protocol === "https:"
@@ -196,6 +206,9 @@ export async function analyzePage(url: string): Promise<PageAnalysis> {
 
     if ($('link[rel~="icon"], link[rel="shortcut icon"]').length === 0)
       add("no-favicon", "No favicon defined", "design", "low")
+
+    // ---------- Neglect / staleness signals ----------
+    issues.push(...stalenessIssues({ $, html, lastModified }))
 
     // ---------- Scores ----------
     const seoScore = scoreCategory(issues, "seo")
